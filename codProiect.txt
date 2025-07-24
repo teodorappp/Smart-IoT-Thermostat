@@ -1,0 +1,238 @@
+//cod criptare/decriptare AES
+
+#include <AESLib.h>
+
+byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
+IPAddress ip(192, 168, 1, 21);
+EthernetServer server(80);
+
+AESLib aesLib;
+
+byte aes_key[] = { 0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6,
+                   0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c };
+byte iv[] = { 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+              0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f };
+
+struct Utilizator {
+  String username;
+  String password;
+  byte cod2FA_criptat[16];
+};
+
+Utilizator utilizatori[] = {
+  {"admin", "admin123", {0}},
+  {"user1", "parola1", {0}},
+  {"user2", "parola2", {0}}
+};
+
+...
+
+void cripteazaCod2FA(String cod, byte* buffer) {
+  byte plain[16] = {0};
+  for (int i = 0; i < cod.length(); i++) {
+    plain[i] = cod.charAt(i);
+  }
+  byte iv_copy[16];
+  memcpy(iv_copy, iv, 16);
+
+  aesLib.encrypt((byte*)plain, 16, buffer, aes_key, 128, iv_copy);
+}
+
+bool comparaCod2FA(String cod, byte* codCriptat) {
+  byte buffer[16];
+  byte plain[16] = {0};
+  for (int i = 0; i < cod.length(); i++) {
+    plain[i] = cod.charAt(i);
+  }
+  byte iv_copy[16];
+  memcpy(iv_copy, iv, 16);
+
+  aesLib.encrypt((byte*)plain, 16, buffer, aes_key, 128, iv_copy);
+
+  for (int i = 0; i < 16; i++) {
+    if (buffer[i] != codCriptat[i]) return false;
+  }
+  return true;
+}
+
+// decriptare
+void decripteazaCod2FA(byte* codCriptat, char* output) {
+  byte iv_copy[16];
+  memcpy(iv_copy, iv, 16);
+
+  byte decrypted[16];
+  aesLib.decrypt(codCriptat, 16, decrypted, aes_key, 128, iv_copy);
+
+  for (int i = 0; i < 16; i++) {
+    output[i] = decrypted[i];
+  }
+  output[16] = '\0'; // terminator string
+}
+
+//cod pentru generare codaFA
+String genereazaCod2FA() {
+  // Generează cod 4 cifre aleator
+  int cod = random(1000, 9999);
+  return String(cod);
+}
+
+//bool pentru validare date si alerte
+void loop() {
+  EthernetClient client = server.available();
+  if (client) {
+    IPAddress ipClient = client.remoteIP();
+    Serial.print("Conectare de la: ");
+    Serial.println(ipClient);
+
+    // === Validare rețea locală ===
+    bool ipAcceptat = (ipClient[0] == 192 && ipClient[1] == 168); // doar IP-uri din rețea locală
+    if (!ipAcceptat) {
+      logAlerta("IP suspect acces neautorizat", ipClient);
+  client.println("HTTP/1.1 403 Forbidden");
+  client.println("Content-Type: text/html");
+  client.println();
+  client.println("<html><body><h1>Acces interzis</h1><p>IP necunoscut.</p></body></html>");
+  client.stop();
+  return;
+    }
+
+    String request = "";
+    unsigned long timeout = millis() + 3000;
+    while (client.connected() && millis() < timeout) {
+      if (client.available()) {
+        char c = client.read();
+        request += c;
+        if (request.endsWith("\r\n\r\n")) break;
+      }
+    }
+
+    Serial.println("Cerere: ");
+    Serial.println(request);
+
+    int idx1 = request.indexOf("GET ");
+    int idx2 = request.indexOf(" HTTP");
+    String linieGet = "";
+    if (idx1 != -1 && idx2 != -1) {
+      linieGet = request.substring(idx1 + 4, idx2);
+    }
+
+    Serial.print("Linie GET: ");
+    Serial.println(linieGet);
+
+    // === Rutare ===
+    if (linieGet.startsWith("/login")) {
+      String user = getParamValue(linieGet, "user");
+      String pass = getParamValue(linieGet, "pass");
+
+      if (!autentificat && user.length() > 0 && pass.length() > 0) {
+        if (verificaCredentiale(user, pass)) {
+          utilizatorCurent = user;
+          cod2FAGenerat = genereazaCod2FA();
+          pas2FA = true;
+          Serial.print("Cod 2FA pentru ");
+          Serial.print(user);
+          Serial.print(": ");
+          Serial.println(cod2FAGenerat);
+          pagina2FA(client);  // Trimite pagina de cod 2FA
+        } else {
+          paginaLogin(client, "Credențiale invalide.");
+        }
+      } else {
+        paginaLogin(client); // fallback
+      }
+
+    } else if (linieGet.startsWith("/2fa")) {
+      String cod = getParamValue(linieGet, "cod");
+      if (pas2FA && cod.length() > 0) {
+        if (cod == cod2FAGenerat) {
+          autentificat = true;
+          pas2FA = false;
+          cod2FAGenerat = "";
+          paginaSucces(client);
+        } else {
+          pagina2FA(client, "Cod 2FA greșit.");
+        }
+      } else {
+        paginaLogin(client);
+      }
+
+    } else if (linieGet.startsWith("/termostat")) {
+      if (autentificat) {
+        // Citim temperatura
+        temperaturaCamera = analogRead(A0) * (5.0 / 1023.0) * 10.0; // Ex: senzor LM35
+
+        if (!temperaturaValida(temperaturaCamera)) {
+          // Date suspecte: nu activăm releul, alertă
+          releuActiv = false;
+          digitalWrite(pinReleu, LOW);
+          logAlerta("Temperatura suspectă raportată: " + String(temperaturaCamera), ipClient);
+
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: text/html; charset=UTF-8");
+  client.println();
+  client.println("<html><body>");
+  client.println("<h1>ALERTĂ: Temperatura raportată este suspectă!</h1>");
+  client.println("<p>Releul nu a fost activat.</p>");
+  client.println("<a href='/termostat'>Înapoi</a>");
+  client.println("</body></html>");
+  client.stop();
+  return;
+        } else {
+          // Date valide: activăm releul dacă temperatura depășește pragul
+          if (temperaturaCamera > pragAlarma) {
+            releuActiv = true;
+            digitalWrite(pinReleu, HIGH);
+          } else {
+            releuActiv = false;
+            digitalWrite(pinReleu, LOW);
+          }
+          paginaTermostat(client);
+        }
+      } else {
+        client.println("HTTP/1.1 302 Found");
+        client.println("Location: /login");
+        client.println();
+      }
+
+    } else if (linieGet.startsWith("/logout")) {
+      autentificat = false;
+      utilizatorCurent = "";
+      pas2FA = false;
+      paginaLogout(client);
+
+    } else if (linieGet.startsWith("/setare")) {
+      if (autentificat) {
+        String prag = getParamValue(linieGet, "prag");
+        float pragNou = prag.toFloat();
+        if (pragNou >= 10.0 && pragNou <= 50.0) {
+          pragAlarma = pragNou;
+          paginaTermostat(client, "Prag setat cu succes.");
+        } else {
+          paginaTermostat(client, "Pragul introdus este invalid.");
+        }
+      } else {
+        client.println("HTTP/1.1 302 Found");
+        client.println("Location: /login");
+        client.println();
+      }
+
+    } else {
+      client.println("HTTP/1.1 302 Found");
+      client.println("Location: /login");
+      client.println();
+    }
+if (linieGet == "/favicon.ico") {
+  client.println("HTTP/1.1 204 No Content");
+  client.println("Connection: close");
+  client.println();
+  client.stop();
+  return;
+}
+
+    delay(1);
+    client.stop();  // Închide conexiunea
+  }
+}
+
+
+
